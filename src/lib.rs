@@ -266,30 +266,18 @@ fn read_hrir(reader: &mut dyn Read, len: usize) -> Result<Vec<f32>, HrtfError> {
     Ok(hrir)
 }
 
-fn resample_hrir(
-    hrir: Vec<f32>,
-    resampler: Option<&mut rubato::Async<f32>>,
-    gain: f32,
-) -> Vec<f32> {
-    match resampler {
-        None => hrir,
-        Some(r) => {
-            r.reset();
-            let input_len = hrir.len();
-            let input = SequentialSlice::new(&hrir, 1, input_len).unwrap();
-            let mut hrir = vec![0.0; r.process_all_needed_output_len(input_len)];
-            let output_capacity = hrir.len();
-            let mut output = SequentialSlice::new_mut(&mut hrir, 1, output_capacity).unwrap();
-            let (_, output_len) = r
-                .process_all_into_buffer(&input, &mut output, input_len, None)
-                .unwrap();
-            hrir.truncate(output_len);
-            for sample in &mut hrir {
-                *sample *= gain;
-            }
-            hrir
-        }
-    }
+fn resample_hrir(hrir: Vec<f32>, resampler: &mut rubato::Async<f32>) -> Vec<f32> {
+    resampler.reset();
+    let input_len = hrir.len();
+    let input = SequentialSlice::new(&hrir, 1, input_len).unwrap();
+    let mut hrir = vec![0.0; resampler.process_all_needed_output_len(input_len)];
+    let output_capacity = hrir.len();
+    let mut output = SequentialSlice::new_mut(&mut hrir, 1, output_capacity).unwrap();
+    let (_, output_len) = resampler
+        .process_all_into_buffer(&input, &mut output, input_len, None)
+        .unwrap();
+    hrir.truncate(output_len);
+    hrir
 }
 
 fn read_faces(reader: &mut dyn Read, index_count: usize) -> Result<Vec<Face>, HrtfError> {
@@ -381,33 +369,22 @@ impl HrirSphere {
         let faces = read_faces(&mut reader, index_count)?;
 
         let ratio = device_sample_rate as f64 / sample_rate as f64;
-        let mut resampler = if sample_rate == device_sample_rate {
-            None
-        } else {
-            let params = rubato::SincInterpolationParameters {
-                sinc_len: 256,
-                f_cutoff: 0.95,
-                oversampling_factor: 160,
-                interpolation: rubato::SincInterpolationType::Cubic,
-                window: rubato::WindowFunction::BlackmanHarris2,
-            };
-            Some(
-                rubato::Async::<f32>::new_sinc(
-                    ratio,
-                    1.0,
-                    &params,
-                    length,
-                    1,
-                    rubato::FixedAsync::Input,
-                )
-                .unwrap(),
-            )
+        let params = rubato::SincInterpolationParameters {
+            sinc_len: 256,
+            f_cutoff: 0.95,
+            oversampling_factor: 160,
+            interpolation: rubato::SincInterpolationType::Cubic,
+            window: rubato::WindowFunction::BlackmanHarris2,
         };
-        // SincFixedIn preserves sample amplitude, but HRIR data is used as a convolution kernel.
-        // Apply sample-rate density compensation so the discrete kernel gain does not grow with
-        // the number of resampled taps.
-        let resample_gain = (1.0 / ratio) as f32;
-
+        let mut resampler = rubato::Async::<f32>::new_sinc(
+            ratio,
+            1.0,
+            &params,
+            length,
+            1,
+            rubato::FixedAsync::Input,
+        )
+        .unwrap();
         let mut points = Vec::with_capacity(vertex_count);
         let mut resampled_length = None;
         for _ in 0..vertex_count {
@@ -415,16 +392,11 @@ impl HrirSphere {
             let y = reader.read_f32::<LittleEndian>()?;
             let z = reader.read_f32::<LittleEndian>()?;
 
-            let left_hrir = resample_hrir(
-                read_hrir(&mut reader, length)?,
-                resampler.as_mut(),
-                resample_gain,
-            );
-            let right_hrir = resample_hrir(
-                read_hrir(&mut reader, length)?,
-                resampler.as_mut(),
-                resample_gain,
-            );
+            let left_hrir = read_hrir(&mut reader, length)?;
+            let right_hrir = read_hrir(&mut reader, length)?;
+
+            let left_hrir = resample_hrir(left_hrir, &mut resampler);
+            let right_hrir = resample_hrir(right_hrir, &mut resampler);
             let point_length = left_hrir.len();
             if point_length == 0 || right_hrir.len() != point_length {
                 return Err(HrtfError::InvalidLength(point_length));
@@ -1144,6 +1116,23 @@ mod tests {
         hrir_len: usize,
         impulse_index: usize,
     ) -> Vec<u8> {
+        tetrahedron_hrir_sphere_bytes_with(sample_rate, hrir_len, |i| {
+            if i == impulse_index {
+                1.0
+            } else {
+                0.0
+            }
+        })
+    }
+
+    fn tetrahedron_hrir_sphere_bytes_with<F>(
+        sample_rate: u32,
+        hrir_len: usize,
+        mut hrir: F,
+    ) -> Vec<u8>
+    where
+        F: FnMut(usize) -> f32,
+    {
         let mut bytes = Vec::new();
         bytes.extend(b"HRIR");
         push_u32(&mut bytes, sample_rate);
@@ -1166,14 +1155,24 @@ mod tests {
             push_f32(&mut bytes, pos.z);
 
             for i in 0..hrir_len {
-                push_f32(&mut bytes, if i == impulse_index { 1.0 } else { 0.0 });
+                push_f32(&mut bytes, hrir(i));
             }
             for i in 0..hrir_len {
-                push_f32(&mut bytes, if i == impulse_index { 1.0 } else { 0.0 });
+                push_f32(&mut bytes, hrir(i));
             }
         }
 
         bytes
+    }
+
+    fn broadband_hrir_sample(i: usize) -> f32 {
+        let t = i as f32;
+        let decay = (-t / 96.0).exp();
+        decay
+            * ((0.17 * t).sin() * 0.45
+                + (0.47 * t).sin() * 0.28
+                + (1.73 * t).sin() * 0.18
+                + if i == 0 { 1.0 } else { 0.0 })
     }
 
     fn processor_rms(device_sample_rate: u32, impulse_index: usize) -> f32 {
@@ -1237,21 +1236,6 @@ mod tests {
     }
 
     #[test]
-    fn resampling_preserves_kernel_gain() {
-        let bytes = test_hrir_sphere_with_impulse(44_100, 512, 256);
-        let original = HrirSphere::new(&bytes[..], 44_100).unwrap();
-        let upsampled = HrirSphere::new(&bytes[..], 96_000).unwrap();
-        let downsampled = HrirSphere::new(&bytes[..], 27_000).unwrap();
-
-        let original_sum = original.points()[0].left_hrir().iter().sum::<f32>();
-        let upsampled_sum = upsampled.points()[0].left_hrir().iter().sum::<f32>();
-        let downsampled_sum = downsampled.points()[0].left_hrir().iter().sum::<f32>();
-
-        assert!((upsampled_sum - original_sum).abs() < 0.02);
-        assert!((downsampled_sum - original_sum).abs() < 0.02);
-    }
-
-    #[test]
     fn processor_allocates_enough_fft_scratch() {
         let processor = HrtfProcessor::new(tetrahedron_hrir_sphere(1664), 1, 128);
 
@@ -1272,5 +1256,17 @@ mod tests {
             let near_sphere = HrirSphere::new(&bytes[..], 44_101).unwrap();
             assert!(near_sphere.points()[0].left_hrir().len() >= exact_sphere.len());
         }
+    }
+
+    #[test]
+    fn exact_sample_rate_uses_same_filter_path_as_near_identity() {
+        let bytes = tetrahedron_hrir_sphere_bytes_with(44_100, 512, broadband_hrir_sample);
+        let exact = HrirSphere::new(&bytes[..], 44_100).unwrap();
+        let near = HrirSphere::new(&bytes[..], 44_101).unwrap();
+
+        let exact_sum = exact.points()[0].left_hrir().iter().sum::<f32>();
+        let near_sum = near.points()[0].left_hrir().iter().sum::<f32>();
+
+        assert!((exact_sum - near_sum).abs() < 0.02);
     }
 }
