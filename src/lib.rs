@@ -265,13 +265,21 @@ fn read_hrir(reader: &mut dyn Read, len: usize) -> Result<Vec<f32>, HrtfError> {
     Ok(hrir)
 }
 
-fn resample_hrir(hrir: Vec<f32>, resampler: Option<&mut rubato::SincFixedIn<f32>>) -> Vec<f32> {
+fn resample_hrir(
+    hrir: Vec<f32>,
+    resampler: Option<&mut rubato::SincFixedIn<f32>>,
+    gain: f32,
+) -> Vec<f32> {
     match resampler {
         None => hrir,
         Some(r) => {
             r.reset();
             let result = r.process(&[hrir], None).unwrap();
-            result.into_iter().next().unwrap()
+            let mut hrir = result.into_iter().next().unwrap();
+            for sample in &mut hrir {
+                *sample *= gain;
+            }
+            hrir
         }
     }
 }
@@ -364,8 +372,8 @@ impl HrirSphere {
 
         let faces = read_faces(&mut reader, index_count)?;
 
-        let ratio = sample_rate as f64 / device_sample_rate as f64;
-        let mut resampler = if ratio == 1.0 {
+        let ratio = device_sample_rate as f64 / sample_rate as f64;
+        let mut resampler = if sample_rate == device_sample_rate {
             None
         } else {
             let params = rubato::SincInterpolationParameters {
@@ -377,15 +385,39 @@ impl HrirSphere {
             };
             Some(rubato::SincFixedIn::<f32>::new(ratio, 1.0, params, length, 1).unwrap())
         };
+        // SincFixedIn preserves sample amplitude, but HRIR data is used as a convolution kernel.
+        // Apply sample-rate density compensation so the discrete kernel gain does not grow with
+        // the number of resampled taps.
+        let resample_gain = (1.0 / ratio) as f32;
 
         let mut points = Vec::with_capacity(vertex_count);
+        let mut resampled_length = None;
         for _ in 0..vertex_count {
             let x = reader.read_f32::<LittleEndian>()?;
             let y = reader.read_f32::<LittleEndian>()?;
             let z = reader.read_f32::<LittleEndian>()?;
 
-            let left_hrir = resample_hrir(read_hrir(&mut reader, length)?, resampler.as_mut());
-            let right_hrir = resample_hrir(read_hrir(&mut reader, length)?, resampler.as_mut());
+            let left_hrir = resample_hrir(
+                read_hrir(&mut reader, length)?,
+                resampler.as_mut(),
+                resample_gain,
+            );
+            let right_hrir = resample_hrir(
+                read_hrir(&mut reader, length)?,
+                resampler.as_mut(),
+                resample_gain,
+            );
+            let point_length = left_hrir.len();
+            if point_length == 0 || right_hrir.len() != point_length {
+                return Err(HrtfError::InvalidLength(point_length));
+            }
+            match resampled_length {
+                None => resampled_length = Some(point_length),
+                Some(expected_length) if expected_length != point_length => {
+                    return Err(HrtfError::InvalidLength(point_length));
+                }
+                Some(_) => {}
+            }
 
             points.push(HrirPoint {
                 pos: Vec3 { x, y, z },
@@ -396,7 +428,7 @@ impl HrirSphere {
 
         Ok(Self {
             points,
-            length,
+            length: resampled_length.unwrap_or(length),
             faces,
             source: Default::default(),
         })
@@ -879,13 +911,19 @@ impl HrtfProcessor {
 
         let mut planner = FftPlanner::new();
 
+        let fft = planner.plan_fft_forward(pad_length);
+        let ifft = planner.plan_fft_inverse(pad_length);
+        let scratch_len = fft
+            .get_inplace_scratch_len()
+            .max(ifft.get_inplace_scratch_len());
+
         Self {
             hrtf_sphere,
             left_in_buffer: vec![Complex::zero(); pad_length],
             right_in_buffer: vec![Complex::zero(); pad_length],
-            scratch_buffer: vec![Complex::zero(); pad_length],
-            fft: planner.plan_fft_forward(pad_length),
-            ifft: planner.plan_fft_inverse(pad_length),
+            scratch_buffer: vec![Complex::zero(); scratch_len],
+            fft,
+            ifft,
             left_hrtf,
             right_hrtf,
             block_len,
@@ -1008,5 +1046,123 @@ impl HrtfProcessor {
                 *out_right += processed_right.re * k;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn push_u32(bytes: &mut Vec<u8>, value: u32) {
+        bytes.extend(value.to_le_bytes());
+    }
+
+    fn push_f32(bytes: &mut Vec<u8>, value: f32) {
+        bytes.extend(value.to_le_bytes());
+    }
+
+    fn test_hrir_sphere(sample_rate: u32, hrir_len: usize) -> Vec<u8> {
+        test_hrir_sphere_with_impulse(sample_rate, hrir_len, 0)
+    }
+
+    fn test_hrir_sphere_with_impulse(
+        sample_rate: u32,
+        hrir_len: usize,
+        impulse_index: usize,
+    ) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend(b"HRIR");
+        push_u32(&mut bytes, sample_rate);
+        push_u32(&mut bytes, hrir_len as u32);
+        push_u32(&mut bytes, 1);
+        push_u32(&mut bytes, 0);
+
+        push_f32(&mut bytes, 0.0);
+        push_f32(&mut bytes, 0.0);
+        push_f32(&mut bytes, 1.0);
+
+        for i in 0..hrir_len {
+            push_f32(&mut bytes, if i == impulse_index { 1.0 } else { 0.0 });
+        }
+        for i in 0..hrir_len {
+            push_f32(&mut bytes, if i == impulse_index { 1.0 } else { 0.0 });
+        }
+
+        bytes
+    }
+
+    fn tetrahedron_hrir_sphere(hrir_len: usize) -> HrirSphere {
+        let points = [
+            Vec3::new(1.0, 1.0, 1.0),
+            Vec3::new(-1.0, -1.0, 1.0),
+            Vec3::new(-1.0, 1.0, -1.0),
+            Vec3::new(1.0, -1.0, -1.0),
+        ]
+        .iter()
+        .copied()
+        .map(|pos| HrirPoint {
+            pos,
+            left_hrir: vec![0.0; hrir_len],
+            right_hrir: vec![0.0; hrir_len],
+        })
+        .collect();
+
+        HrirSphere {
+            length: hrir_len,
+            points,
+            faces: vec![
+                Face { a: 0, b: 1, c: 2 },
+                Face { a: 0, b: 3, c: 1 },
+                Face { a: 0, b: 2, c: 3 },
+                Face { a: 1, b: 3, c: 2 },
+            ],
+            source: Default::default(),
+        }
+    }
+
+    #[test]
+    fn resampling_updates_reported_hrir_length() {
+        let bytes = test_hrir_sphere(44_100, 512);
+
+        let original = HrirSphere::new(&bytes[..], 44_100).unwrap();
+        let upsampled = HrirSphere::new(&bytes[..], 96_000).unwrap();
+        let downsampled = HrirSphere::new(&bytes[..], 27_000).unwrap();
+
+        assert_eq!(original.len(), 512);
+        assert_eq!(original.points()[0].left_hrir().len(), original.len());
+
+        assert!(upsampled.len() > original.len());
+        assert_eq!(upsampled.points()[0].left_hrir().len(), upsampled.len());
+        assert_eq!(upsampled.points()[0].right_hrir().len(), upsampled.len());
+
+        assert!(downsampled.len() < original.len());
+        assert_eq!(downsampled.points()[0].left_hrir().len(), downsampled.len());
+        assert_eq!(
+            downsampled.points()[0].right_hrir().len(),
+            downsampled.len()
+        );
+    }
+
+    #[test]
+    fn resampling_preserves_kernel_gain() {
+        let bytes = test_hrir_sphere_with_impulse(44_100, 512, 256);
+        let original = HrirSphere::new(&bytes[..], 44_100).unwrap();
+        let upsampled = HrirSphere::new(&bytes[..], 96_000).unwrap();
+        let downsampled = HrirSphere::new(&bytes[..], 27_000).unwrap();
+
+        let original_sum = original.points()[0].left_hrir().iter().sum::<f32>();
+        let upsampled_sum = upsampled.points()[0].left_hrir().iter().sum::<f32>();
+        let downsampled_sum = downsampled.points()[0].left_hrir().iter().sum::<f32>();
+
+        assert!((upsampled_sum - original_sum).abs() < 0.02);
+        assert!((downsampled_sum - original_sum).abs() < 0.02);
+    }
+
+    #[test]
+    fn processor_allocates_enough_fft_scratch() {
+        let processor = HrtfProcessor::new(tetrahedron_hrir_sphere(1664), 1, 128);
+
+        assert!(processor.scratch_buffer.len() >= processor.fft.get_inplace_scratch_len());
+        assert!(processor.scratch_buffer.len() >= processor.ifft.get_inplace_scratch_len());
     }
 }
