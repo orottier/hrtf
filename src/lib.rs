@@ -414,6 +414,7 @@ impl HrirSphere {
             match resampled_length {
                 None => resampled_length = Some(point_length),
                 Some(expected_length) if expected_length != point_length => {
+                    // Convolution assumes every HRIR in the sphere has the same length.
                     return Err(HrtfError::InvalidLength(point_length));
                 }
                 Some(_) => {}
