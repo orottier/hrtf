@@ -269,13 +269,24 @@ fn resample_hrir(
     hrir: Vec<f32>,
     resampler: Option<&mut rubato::SincFixedIn<f32>>,
     gain: f32,
+    expected_len: usize,
 ) -> Vec<f32> {
     match resampler {
         None => hrir,
         Some(r) => {
             r.reset();
-            let result = r.process(&[hrir], None).unwrap();
+            let result = r.process_partial(Some(&[hrir]), None).unwrap();
             let mut hrir = result.into_iter().next().unwrap();
+            // HRIRs are finite kernels, so drain delayed samples from the streaming resampler.
+            while hrir.len() < expected_len {
+                let mut tail = r.process_partial::<Vec<f32>>(None, None).unwrap();
+                let tail = tail.remove(0);
+                if tail.is_empty() {
+                    break;
+                }
+                hrir.extend(tail);
+            }
+            hrir.truncate(expected_len);
             for sample in &mut hrir {
                 *sample *= gain;
             }
@@ -389,6 +400,7 @@ impl HrirSphere {
         // Apply sample-rate density compensation so the discrete kernel gain does not grow with
         // the number of resampled taps.
         let resample_gain = (1.0 / ratio) as f32;
+        let expected_resampled_length = ((length as f64) * ratio).round().max(1.0) as usize;
 
         let mut points = Vec::with_capacity(vertex_count);
         let mut resampled_length = None;
@@ -401,11 +413,13 @@ impl HrirSphere {
                 read_hrir(&mut reader, length)?,
                 resampler.as_mut(),
                 resample_gain,
+                expected_resampled_length,
             );
             let right_hrir = resample_hrir(
                 read_hrir(&mut reader, length)?,
                 resampler.as_mut(),
                 resample_gain,
+                expected_resampled_length,
             );
             let point_length = left_hrir.len();
             if point_length == 0 || right_hrir.len() != point_length {
@@ -1121,6 +1135,80 @@ mod tests {
         }
     }
 
+    fn tetrahedron_hrir_sphere_bytes(
+        sample_rate: u32,
+        hrir_len: usize,
+        impulse_index: usize,
+    ) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend(b"HRIR");
+        push_u32(&mut bytes, sample_rate);
+        push_u32(&mut bytes, hrir_len as u32);
+        push_u32(&mut bytes, 4);
+        push_u32(&mut bytes, 12);
+
+        for index in [0_u32, 1, 2, 0, 3, 1, 0, 2, 3, 1, 3, 2] {
+            push_u32(&mut bytes, index);
+        }
+
+        for pos in [
+            Vec3::new(1.0, 1.0, 1.0),
+            Vec3::new(-1.0, -1.0, 1.0),
+            Vec3::new(-1.0, 1.0, -1.0),
+            Vec3::new(1.0, -1.0, -1.0),
+        ] {
+            push_f32(&mut bytes, pos.x);
+            push_f32(&mut bytes, pos.y);
+            push_f32(&mut bytes, pos.z);
+
+            for i in 0..hrir_len {
+                push_f32(&mut bytes, if i == impulse_index { 1.0 } else { 0.0 });
+            }
+            for i in 0..hrir_len {
+                push_f32(&mut bytes, if i == impulse_index { 1.0 } else { 0.0 });
+            }
+        }
+
+        bytes
+    }
+
+    fn processor_rms(device_sample_rate: u32, impulse_index: usize) -> f32 {
+        let bytes = tetrahedron_hrir_sphere_bytes(44_100, 512, impulse_index);
+        let hrir_sphere = HrirSphere::new(&bytes[..], device_sample_rate).unwrap();
+        let mut processor = HrtfProcessor::new(hrir_sphere, 8, 128);
+        let mut prev_left_samples = vec![];
+        let mut prev_right_samples = vec![];
+        let mut seed = 0x1234_5678_u32;
+        let source = (0..1024)
+            .map(|_| {
+                seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                (seed as f32 / u32::MAX as f32) * 2.0 - 1.0
+            })
+            .collect::<Vec<_>>();
+
+        let mut sum = 0.0;
+        let mut count = 0_usize;
+        for _ in 0..128 {
+            let mut output = vec![(0.0, 0.0); 1024];
+            processor.process_samples(HrtfContext {
+                source: &source,
+                output: &mut output,
+                new_sample_vector: Vec3::new(0.0, 0.0, 1.0),
+                prev_sample_vector: Vec3::new(0.0, 0.0, 1.0),
+                prev_left_samples: &mut prev_left_samples,
+                prev_right_samples: &mut prev_right_samples,
+                new_distance_gain: 1.0,
+                prev_distance_gain: 1.0,
+            });
+            for (left, right) in output {
+                sum += left * left + right * right;
+                count += 2;
+            }
+        }
+
+        (sum / count as f32).sqrt()
+    }
+
     #[test]
     fn resampling_updates_reported_hrir_length() {
         let bytes = test_hrir_sphere(44_100, 512);
@@ -1165,5 +1253,20 @@ mod tests {
 
         assert!(processor.scratch_buffer.len() >= processor.fft.get_inplace_scratch_len());
         assert!(processor.scratch_buffer.len() >= processor.ifft.get_inplace_scratch_len());
+    }
+
+    #[test]
+    fn near_identity_resampling_does_not_drop_delayed_hrir_tail() {
+        let exact = processor_rms(44_100, 0);
+        let near = processor_rms(44_101, 0);
+
+        assert!(near > exact * 0.9);
+
+        for impulse_index in [0, 1, 32, 128, 256, 511] {
+            let bytes = tetrahedron_hrir_sphere_bytes(44_100, 512, impulse_index);
+            let exact_sphere = HrirSphere::new(&bytes[..], 44_100).unwrap();
+            let near_sphere = HrirSphere::new(&bytes[..], 44_101).unwrap();
+            assert_eq!(near_sphere.points()[0].left_hrir().len(), exact_sphere.len());
+        }
     }
 }
